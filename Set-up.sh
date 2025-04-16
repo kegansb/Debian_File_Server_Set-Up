@@ -155,7 +155,7 @@ run_command apt update
 run_command apt upgrade -y
 run_command apt install -y samba samba-common-bin net-tools atop htop vim ufw fail2ban unattended-upgrades
 if [ "$AD_JOIN" = "y" ]; then
-    run_command apt install -y realmd sssd sssd-tools krb5-user samba-winbind
+    run_command apt install -y realmd sssd sssd-tools krb5-user winbind libnss-winbind libpam-winbind
 fi
 
 # Configure automatic updates
@@ -181,7 +181,7 @@ $(
 )
 EOF
 
-# Configure static IP using systemd-networkd
+# Configure static IP using systemd-networkdhttps://github.com/kegansb/Debian_File_Server_Set-Up/blob/main/Set-up.sh
 echo "Configuring static IP: $SERVER_IP (no more DHCP roulette!)" | tee -a "$LOGFILE"
 DNS_SERVERS="$DC_IP 8.8.8.8 1.1.1.1"
 for dns in "${EXTRA_DNS[@]}"; do
