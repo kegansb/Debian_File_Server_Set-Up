@@ -3,7 +3,7 @@
 # Script to set up a Debian file server with Samba for Windows, macOS, and Linux
 # Supports Active Directory join, avoids Bind9, uses system/AD passwords
 # Run as root on a clean Debian 12 (Bookworm) minimal install
-# Now with SSH key setup automation and 100% more jokes to keep you sane!
+# Now with SSH key setup automation, sudo fix for admin account, and 100% more jokes to keep you sane!
 
 # Exit on any error
 set -e
@@ -16,7 +16,6 @@ echo "Starting Samba server setup at $(date)" | tee -a "$LOGFILE"
 SAMBA_GROUP="sambausers"
 DEFAULT_WORKGROUP="WORKGROUP"
 DEFAULT_SHARE_NAME="share"
-DEFAULT_PASSWORD="ChangeMe123!"  # Stronger password, because "password" is so 1999
 DEFAULT_DNS="8.8.8.8 1.1.1.1"  # Google and Cloudflare, the DNS dream team
 GATEWAY="192.168.1.1"  # Default gateway, aka "the door to the internet"
 RECYCLE_DIR="/srv/recycle"  # Where deleted files go to sulk
@@ -48,11 +47,26 @@ validate_ssh_key() {
     [[ $key =~ ^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp256) ]] || { echo "That’s not an SSH public key, it’s a cry for help! Starts with ssh-ed25519 or ssh-rsa, try again." | tee -a "$LOGFILE"; return 1; }
 }
 
+# Function to validate username (alphanumeric, no spaces)
+validate_username() {
+    local name=$1
+    [[ $name =~ ^[a-zA-Z0-9]+$ ]] || { echo "Username '$name' is sus. Alphanumeric only, no spaces, you rebel!" | tee -a "$LOGFILE"; return 1; }
+}
+
 # Check if running as root
 if [ "$(id -u)" != "0" ]; then
     echo "Error: This script must be run as root (use sudo). No root, no glory!" | tee -a "$LOGFILE"
     exit 1
 fi
+
+# Prompt for admin account username
+echo "Enter the admin account username to grant sudo privileges (e.g., admin):"
+read -r ADMIN_USER
+while ! validate_username "$ADMIN_USER" || ! id "$ADMIN_USER" > /dev/null 2>&1; do
+    echo "Invalid or non-existent username. Enter a valid, existing username (e.g., admin):"
+    read -r ADMIN_USER
+done
+echo "Admin account: $ADMIN_USER will be granted sudo privileges" | tee -a "$LOGFILE"
 
 # Detect network interface (because eth0 is so last decade)
 INTERFACE=$(ip link | awk -F: '$0 !~ "lo|vir|wl|^[^0-9]"{print $2;getline}' | tr -d ' ' | head -n 1)
@@ -138,22 +152,11 @@ if [ -n "$DNS_INPUT" ]; then
     done
 fi
 
-# Prompt for users (non-AD only)
-if [ "$AD_JOIN" != "y" ]; then
-    echo "Enter usernames to add (comma-separated, e.g., alice,bob):"
-    read -r USER_INPUT
-    IFS=',' read -r -a USERS <<< "$USER_INPUT"
-    if [ ${#USERS[@]} -eq 0 ]; then
-        echo "Error: At least one user is required. Don't leave us lonely!" | tee -a "$LOGFILE"
-        exit 1
-    fi
-fi
-
-# Update system and install packages
+# Update system and install packages (added sudo package)
 echo "Updating system and installing packages... (grab a coffee, this might take a sec)" | tee -a "$LOGFILE"
 run_command apt update
 run_command apt upgrade -y
-run_command apt install -y samba samba-common-bin net-tools atop htop vim ufw fail2ban unattended-upgrades
+run_command apt install -y sudo samba samba-common-bin net-tools atop htop vim ufw fail2ban unattended-upgrades
 if [ "$AD_JOIN" = "y" ]; then
     run_command apt install -y realmd sssd sssd-tools krb5-user winbind libnss-winbind libpam-winbind
 fi
@@ -161,6 +164,21 @@ fi
 # Configure automatic updates
 echo "Configuring automatic updates... because nobody likes a vulnerable server!" | tee -a "$LOGFILE"
 run_command dpkg-reconfigure --priority=low unattended-upgrades
+
+# Grant sudo privileges to admin account
+echo "Granting sudo privileges to $ADMIN_USER... (welcome to the admin club!)" | tee -a "$LOGFILE"
+if ! getent group sudo > /dev/null; then
+    echo "Warning: sudo group not found. Creating it now!" | tee -a "$LOGFILE"
+    run_command groupadd sudo
+fi
+run_command usermod -aG sudo "$ADMIN_USER"
+# Verify sudo access
+if su - "$ADMIN_USER" -c "sudo -n true" 2>/dev/null; then
+    echo "Sudo access verified for $ADMIN_USER. You're officially a power user!" | tee -a "$LOGFILE"
+else
+    echo "Error: Failed to verify sudo access for $ADMIN_USER. Check /etc/sudoers and group membership." | tee -a "$LOGFILE"
+    exit 1
+fi
 
 # Configure DNS
 echo "Configuring DNS... (because without DNS, we're just shouting into the void)" | tee -a "$LOGFILE"
@@ -181,7 +199,7 @@ $(
 )
 EOF
 
-# Configure static IP using systemd-networkdhttps://github.com/kegansb/Debian_File_Server_Set-Up/blob/main/Set-up.sh
+# Configure static IP using systemd-networkd
 echo "Configuring static IP: $SERVER_IP (no more DHCP roulette!)" | tee -a "$LOGFILE"
 DNS_SERVERS="$DC_IP 8.8.8.8 1.1.1.1"
 for dns in "${EXTRA_DNS[@]}"; do
@@ -196,12 +214,8 @@ Address=$SERVER_IP/24
 Gateway=$GATEWAY
 DNS=$DNS_SERVERS
 EOF
-# Another headache found, another fix put into place... Cross those fingers!
-# Check if systemd-networkd is available and not already running
 if systemctl list-unit-files | grep -q systemd-networkd.service; then
     echo "systemd-networkd is available"
-
-    # Check if it's running, only then restart it
     if ! systemctl is-active --quiet systemd-networkd; then
         echo "Enabling and starting systemd-networkd"
         run_command systemctl enable systemd-networkd
@@ -217,8 +231,8 @@ fi
 # Secure SSH
 echo "Securing SSH... because who needs hackers in their life?" | tee -a "$LOGFILE"
 SSH_CONFIG="/etc/ssh/sshd_config"
-run_command cp "$SSH_CONFIG" "${SSH_CONFIG}.bak"  # Backup, because paranoia is a sysadmin's best friend
-cat > "$SSH_CONFIG" << EOL
+run_command cp "$SSH_CONFIG" "${SSH_CONFIG}.bak"
+cat > "$SSH_CONFIG" << EOL eol
 Port 2222
 PermitRootLogin no
 PasswordAuthentication no
@@ -253,11 +267,220 @@ run_command mkdir -p "$SHARE_PATH" "$RECYCLE_DIR"
 run_command chgrp "$SAMBA_GROUP" "$SHARE_PATH"
 run_command chmod 770 "$SHARE_PATH"
 run_command chown root:root "$RECYCLE_DIR"
-run_command chmod 1777 "$RECYCLE_DIR"  # Sticky bit, because deleted files need a timeout corner
+run_command chmod 1777 "$RECYCLE_DIR"
+
+# Active Directory join
+SSH_USERS=()
+if [ "$AD_JOIN" = "y" ]; then
+    echo "Testing AD connectivity... (please don't be offline, DC!)" | tee -a "$LOGFILE"
+    if ! ping -c 2 "$DC_IP" > /dev/null; then
+        echo "Error: Cannot reach domain controller $DC_IP. Is it napping?" | tee -a "$LOGFILE"
+        exit 1
+    fi
+    echo "Configuring Kerberos... (time to speak AD's secret handshake)" | tee -a "$LOGFILE"
+    cat > /etc/krb5.conf << EOF
+[libdefaults]
+    default_realm = ${DOMAIN_NAME^^}
+    dns_lookup_realm = true
+    dns_lookup_kdc = true
+EOF
+    echo "Joining AD domain: $DOMAIN_NAME (wish us luck!)" | tee -a "$LOGFILE"
+    echo "$AD_PASSWORD" | run_command realm join -U "$AD_ADMIN" "$DOMAIN_NAME" --install=/
+    echo "Configuring SSSD... (making AD and Linux play nice)" | tee -a "$LOGFILE"
+    cat > /etc/sssd/sssd.conf << EOF
+[sssd]
+services = nss, pam
+config_file_version = 2
+domains = $DOMAIN_NAME
+
+[domain/$DOMAIN_NAME]
+id_provider = ad
+auth_provider = ad
+access_provider = ad
+cache_credentials = true
+krb5_store_password_if_offline = true
+default_shell = /bin/bash
+fallback_homedir = /home/%u
+EOF
+    run_command chmod 600 /etc/sssd/sssd.conf
+    run_command systemctl restart sssd
+    run_command systemctl enable sssd
+
+    # Setup SSH keys for AD users
+    echo "Configure SSH keys for AD users? (y/N):"
+    read -r AD_SSH_ANSWER
+    if [ "${AD_SSH_ANSWER,,}" = "y" ]; then
+        echo "Enter AD usernames to configure SSH for (comma-separated, e.g., alice,bob):"
+        read -r AD_USER_INPUT
+        IFS=',' read -r -a AD_USERS <<< "$AD_USER_INPUT"
+        for AD_USER in "${AD_USERS[@]}"; do
+            AD_USER=$(echo "$AD_USER" | tr -d '[:space:]')
+            [ -z "$AD_USER" ] && continue
+            echo "Processing SSH setup for AD user: $AD_USER" | tee -a "$LOGFILE"
+            SSH_DIR="/home/$AD_USER/.ssh"
+            AUTH_KEYS="$SSH_DIR/authorized_keys"
+            if ! id "$AD_USER" > /dev/null 2>&1; then
+                echo "Warning: AD user $AD_USER not found. Ensure they log in first or check SSSD config." | tee -a "$LOGFILE"
+                continue
+            fi
+            run_command mkdir -p "$SSH_DIR"
+            run_command chown "$ADMIN_USER":"$ADMIN_USER" "$SSH_DIR"
+            run_command chmod 700 "$SSH_DIR"
+            echo "Paste the SSH public key for $AD_USER (e.g., ssh-ed25519 AAAAC3...):"
+            read -r SSH_KEY
+            if validate_ssh_key "$SSH_KEY"; then
+                echo "$SSH_KEY" | run_command tee -a "$AUTH_KEYS"
+                run_command chown "$ADMIN_USER":"$ADMIN_USER" "$AUTH_KEYS"
+                run_command chmod 600 "$AUTH_KEYS"
+                SSH_USERS+=("$AD_USER")
+                echo "SSH key added for ADMIN user $AD_USER. Secure access granted!" | tee -a "$LOGFILE"
+            else
+                echo "Snark alert: That key looks like you mashed the keyboard! SSH setup skipped for $AD_USER." | tee -a "$LOGFILE"
+            fi
+        done
+    fi
+fi
+
+# Configure Samba with recycle bin
+echo "Writing Samba configuration... (the moment of truth!)" | tee -a "$LOGFILE"
+echo "Snark alert: Samba configs are like divas—touchy and demanding perfection!" | tee -a "$LOGFILE"
+[ -f /etc/samba/smb.conf ] && run_command cp /etc/samba/smb.conf /etc/samba/smb.conf.bak
+USER_SHARES=""
+if [ "$AD_JOIN" = "y" ]; then
+    cat > /etc/samba/smb.conf << EOF
+[global]
+   security = ads
+   realm = ${DOMAIN_NAME^^}
+   workgroup = ${DOMAIN_NAME%%.*}
+   server string = Debian File Server
+   min protocol = SMB2
+   server min protocol = SMB2
+   idmap config * : backend = tdb
+   idmap config * : range = 3000-7999
+   idmap config ${DOMAIN_NAME^^} : backend = ad
+   idmap config ${DOMAIN_NAME^^} : schema_mode = rfc2307
+   idmap config ${DOMAIN_NAME^^} : range = 10000-999999
+   winbind use default domain = yes
+   winbind offline logon = yes
+   template shell = /bin/bash
+   template homedir = /home/%U
+   vfs objects = recycle
+   recycle:repository = $RECYCLE_DIR/%U
+   recycle:keeptree = yes
+   recycle:versions = yes
+
+[$SHARE_NAME]
+   path = $SHARE_PATH
+   browsable = yes
+   writable = yes
+   read only = no
+   valid users = @"${DOMAIN_NAME^^}\Domain Users"
+   create mask = 0660
+   directory mask = 0770
+EOF
+else
+    cat > /etc/samba/smb.conf << EOF
+[global]
+   workgroup = $WORKGROUP
+   server string = Debian File Server
+   security = user
+   map to guest = never
+   min protocol = SMB2
+   server min protocol = SMB2
+   unix password sync = yes
+   pam password change = yes
+   vfs objects = recycle
+   recycle:repository = $RECYCLE_DIR/%U
+   recycle:keeptree = yes
+   recycle:versions = yes
+
+[$SHARE_NAME]
+   path = $SHARE_PATH
+   browsable = yes
+   writable = yes
+   read only = no
+   valid users = @$SAMBA_GROUP
+   create mask = 0660
+   directory mask = 0770
+   force group = $SAMBA_GROUP
+$USER_SHARES
+EOF
+fi
+
+# Test Samba configuration
+echo "Testing Samba configuration... (please don't crash, Samba!)" | tee -a "$LOGFILE"
+run_command testparm -s /etc/samba/smb.conf
+
+# Restart Samba services
+echo "Restarting Samba services... (wake up, Samba, time to shine!)" | tee -a "$LOGFILE"
+if [ "$AD_JOIN" = "y" ]; then
+    run_command systemctl restart smbd winbind
+ Francis, [4/16/2025 6:08 PM]
+    run_command systemctl enable smbd winbind
+else
+    run_command systemctl restart smbd nmbd
+    run_command systemctl enable smbd nmbd
+fi
+
+# Configure firewall
+echo "Configuring firewall... (building the Great Wall of Debian)" | tee -a "$LOGFILE"
+run_command ufw allow 2222/tcp
+run_command ufw allow Samba
+run_command ufw --force enable
+run_command ufw status
+
+# Output connection instructions
+cat << EOF | tee -a "$LOGFILE"
+Setup complete! File server is ready. Time to share files like it's 1995!
+
+Connection Instructions:
+EOF
+if [ "$AD_JOIN" = "y" ]; then
+    cat << EOF | tee -a "$LOGFILE"
+  Main Share:
+    - Windows: \\\\$SERVER_IP\\$SHARE_NAME, use domain credentials ($DOMAIN_NAME\\username)
+    - macOS: Cmd+K, smb://$SERVER_IP/$SHARE_NAME, use domain username
+    - Linux: mount -t cifs //$SERVER_IP/$SHARE_NAME /mnt -o username=username,domain=$DOMAIN_NAME
+  Note: Use AD credentials. Recycle bin at $RECYCLE_DIR (for those "oops" moments).
+EOF
+else
+    cat << EOF | tee -a "$LOGFILE"
+  Main Share:
+    - Windows: \\\\$SERVER_IP\\$SHARE_NAME, use system user credentials
+    - macOS: Cmd+K, smb://$SERVER_IP/$SHARE_NAME
+    - Linux: mount -t cifs //$SERVER_IP/$SHARE_NAME /mnt -o username=<username>)
+  Note: Non-AD setups require pre-existing system users in the $SAMBA_GROUP group.
+        To create users, uncomment and run the optional user creation section at the end of this script.
+  Recycle bin at $RECYCLE_DIR (because deleting files is a personality trait).
+EOF
+fi
+cat << EOF | tee -a "$LOGFILE"
+  Server IP: $SERVER_IP
+  DNS Servers: ${DC_IP:-8.8.8.8 1.1.1.1}${EXTRA_DNS:+,${EXTRA_DNS[*]}}
+  Admin Account: $ADMIN_USER (with sudo privileges)
+  SSH: Port 2222, key-based auth only. Users with SSH keys: ${SSH_USERS[*]:-none}.
+  To add more keys, paste them into ~/.ssh/authorized_keys for each user.
+  Log: $LOGFILE (your new bedtime reading)
+EOF
+
+# Optional: Non-AD User Creation Add-In
+# Uncomment the following section to enable manual user creation for non-AD setups
+# Note: Ensure users are added to the $SAMBA_GROUP group and have Samba passwords set
+: '
+DEFAULT_PASSWORD="ChangeMe123!"  # Default password for new users
+# Prompt for users (non-AD only)
+if [ "$AD_JOIN" != "y" ]; then
+    echo "Enter usernames to add (comma-separated, e.g., alice,bob):"
+    read -r USER_INPUT
+    IFS=',' read -r -a USERS <<< "$USER_INPUT"
+    if [ ${#USERS[@]} -eq 0 ]; then
+        echo "Error: At least one user is required. Don'"'"'t leave us lonely!" | tee -a "$LOGFILE"
+        exit 1
+    fi
+fi
 
 # Process users (non-AD only)
 USER_SHARES=""
-SSH_USERS=()
 if [ "$AD_JOIN" != "y" ]; then
     for USER in "${USERS[@]}"; do
         USER=$(echo "$USER" | tr -d '[:space:]')
@@ -332,203 +555,6 @@ if [ "$AD_JOIN" != "y" ]; then
         fi
     done
 fi
-
-# Active Directory join
-if [ "$AD_JOIN" = "y" ]; then
-    echo "Testing AD connectivity... (please don't be offline, DC!)" | tee -a "$LOGFILE"
-    if ! ping -c 2 "$DC_IP" > /dev/null; then
-        echo "Error: Cannot reach domain controller $DC_IP. Is it napping?" | tee -a "$LOGFILE"
-        exit 1
-    fi
-    echo "Configuring Kerberos... (time to speak AD's secret handshake)" | tee -a "$LOGFILE"
-    cat > /etc/krb5.conf << EOF
-[libdefaults]
-    default_realm = ${DOMAIN_NAME^^}
-    dns_lookup_realm = true
-    dns_lookup_kdc = true
-EOF
-    echo "Joining AD domain: $DOMAIN_NAME (wish us luck!)" | tee -a "$LOGFILE"
-    echo "$AD_PASSWORD" | run_command realm join -U "$AD_ADMIN" "$DOMAIN_NAME" --install=/
-    echo "Configuring SSSD... (making AD and Linux play nice)" | tee -a "$LOGFILE"
-    cat > /etc/sssd/sssd.conf << EOF
-[sssd]
-services = nss, pam
-config_file_version = 2
-domains = $DOMAIN_NAME
-
-[domain/$DOMAIN_NAME]
-id_provider = ad
-auth_provider = ad
-access_provider = ad
-cache_credentials = true
-krb5_store_password_if_offline = true
-default_shell = /bin/bash
-fallback_homedir = /home/%u
-EOF
-    run_command chmod 600 /etc/sssd/sssd.conf
-    run_command systemctl restart sssd
-    run_command systemctl enable sssd
-
-    # Setup SSH keys for AD users
-    echo "Configure SSH keys for AD users? (y/N):"
-    read -r AD_SSH_ANSWER
-    if [ "${AD_SSH_ANSWER,,}" = "y" ]; then
-        echo "Enter AD usernames to configure SSH for (comma-separated, e.g., alice,bob):"
-        read -r AD_USER_INPUT
-        IFS=',' read -r -a AD_USERS <<< "$AD_USER_INPUT"
-        for AD_USER in "${AD_USERS[@]}"; do
-            AD_USER=$(echo "$AD_USER" | tr -d '[:space:]')
-            [ -z "$AD_USER" ] && continue
-            echo "Processing SSH setup for AD user: $AD_USER" | tee -a "$LOGFILE"
-            SSH_DIR="/home/$AD_USER/.ssh"
-            AUTH_KEYS="$SSH_DIR/authorized_keys"
-            # Create home directory if it doesn't exist
-            if ! id "$AD_USER" > /dev/null 2>&1; then
-                echo "Warning: AD user $AD_USER not found. Ensure they log in first or check SSSD config." | tee -a "$LOGFILE"
-                continue
-            fi
-            run_command mkdir -p "$SSH_DIR"
-            run_command chown "$AD_USER":"$AD_USER" "$SSH_DIR"
-            run_command chmod 700 "$SSH_DIR"
-            echo "Paste the SSH public key for $AD_USER (e.g., ssh-ed25519 AAAAC3...):"
-            read -r SSH_KEY
-            if validate_ssh_key "$SSH_KEY"; then
-                echo "$SSH_KEY" | run_command tee -a "$AUTH_KEYS"
-                run_command chown "$AD_USER":"$AD_USER" "$AUTH_KEYS"
-                run_command chmod 600 "$AUTH_KEYS"
-                SSH_USERS+=("$AD_USER")
-                echo "SSH key added for AD user $AD_USER. Secure access granted!" | tee -a "$LOGFILE"
-            else
-                echo "Snark alert: That key looks like you mashed the keyboard! SSH setup skipped for $AD_USER." | tee -a "$LOGFILE"
-            fi
-        done
-    fi
-fi
-
-# Configure Samba with recycle bin
-echo "Writing Samba configuration... (the moment of truth!)" | tee -a "$LOGFILE"
-echo "Snark alert: Samba configs are like divas—touchy and demanding perfection!" | tee -a "$LOGFILE"
-[ -f /etc/samba/smb.conf ] && run_command cp /etc/samba/smb.conf /etc/samba/smb.conf.bak  # Backup, because Samba configs are like fine china
-if [ "$AD_JOIN" = "y" ]; then
-    cat > /etc/samba/smb.conf << EOF
-[global]
-   security = ads
-   realm = ${DOMAIN_NAME^^}
-   workgroup = ${DOMAIN_NAME%%.*}
-   server string = Debian File Server
-   min protocol = SMB2
-   server min protocol = SMB2
-   idmap config * : backend = tdb
-   idmap config * : range = 3000-7999
-   idmap config ${DOMAIN_NAME^^} : backend = ad
-   idmap config ${DOMAIN_NAME^^} : schema_mode = rfc2307
-   idmap config ${DOMAIN_NAME^^} : range = 10000-999999
-   winbind use default domain = yes
-   winbind offline logon = yes
-   template shell = /bin/bash
-   template homedir = /home/%U
-   vfs objects = recycle
-   recycle:repository = $RECYCLE_DIR/%U
-   recycle:keeptree = yes
-   recycle:versions = yes
-
-[$SHARE_NAME]
-   path = $SHARE_PATH
-   browsable = yes
-   writable = yes
-   read only = no
-   valid users = @"${DOMAIN_NAME^^}\Domain Users"
-   create mask = 0660
-   directory mask = 0770
-EOF
-else
-    cat > /etc/samba/smb.conf << EOF
-[global]
-   workgroup = $WORKGROUP
-   server string = Debian File Server
-   security = user
-   map to guest = never
-   min protocol = SMB2
-   server min protocol = SMB2
-   unix password sync = yes
-   pam password change = yes
-   vfs objects = recycle
-   recycle:repository = $RECYCLE_DIR/%U
-   recycle:keeptree = yes
-   recycle:versions = yes
-
-[$SHARE_NAME]
-   path = $SHARE_PATH
-   browsable = yes
-   writable = yes
-   read only = no
-   valid users = @$SAMBA_GROUP
-   create mask = 0660
-   directory mask = 0770
-   force group = $SAMBA_GROUP
-$USER_SHARES
-EOF
-fi
-
-# Test Samba configuration
-echo "Testing Samba configuration... (please don't crash, Samba!)" | tee -a "$LOGFILE"
-run_command testparm -s /etc/samba/smb.conf
-
-# Restart Samba services
-echo "Restarting Samba services... (wake up, Samba, time to shine!)" | tee -a "$LOGFILE"
-if [ "$AD_JOIN" = "y" ]; then
-    run_command systemctl restart smbd winbind
-    run_command systemctl enable smbd winbind
-else
-    run_command systemctl restart smbd nmbd
-    run_command systemctl enable smbd nmbd
-fi
-
-# Configure firewall
-echo "Configuring firewall... (building the Great Wall of Debian)" | tee -a "$LOGFILE"
-run_command ufw allow 2222/tcp
-run_command ufw allow Samba
-run_command ufw --force enable
-run_command ufw status
-
-# Output connection instructions
-cat << EOF | tee -a "$LOGFILE"
-Setup complete! File server is ready. Time to share files like it's 1995!
-
-Connection Instructions:
-EOF
-if [ "$AD_JOIN" = "y" ]; then
-    cat << EOF | tee -a "$LOGFILE"
-  Main Share:
-    - Windows: \\\\$SERVER_IP\\$SHARE_NAME, use domain credentials ($DOMAIN_NAME\\username)
-    - macOS: Cmd+K, smb://$SERVER_IP/$SHARE_NAME, use domain username
-    - Linux: mount -t cifs //$SERVER_IP/$SHARE_NAME /mnt -o username=username,domain=$DOMAIN_NAME
-  Note: Use AD credentials. Recycle bin at $RECYCLE_DIR (for those "oops" moments).
-EOF
-else
-    cat << EOF | tee -a "$LOGFILE"
-  Main Share:
-    - Windows: \\\\$SERVER_IP\\$SHARE_NAME, use username (e.g., ${USERS[0]})
-    - macOS: Cmd+K, smb://$SERVER_IP/$SHARE_NAME
-    - Linux: mount -t cifs //$SERVER_IP/$SHARE_NAME /mnt -o username=${USERS[0]})
-  User Shares:
-EOF
-    for USER in "${USERS[@]}"; do
-        [ -z "$USER" ] && continue
-        echo "    - $USER: \\\\$SERVER_IP\\$USER" | tee -a "$LOGFILE"
-    done
-    cat << EOF | tee -a "$LOGFILE"
-  Users: ${USERS[*]} (default password: $DEFAULT_PASSWORD, must change on login)
-  Workgroup: $WORKGROUP
-  Recycle bin at $RECYCLE_DIR (because deleting files is a personality trait).
-EOF
-fi
-cat << EOF | tee -a "$LOGFILE"
-  Server IP: $SERVER_IP
-  DNS Servers: ${DC_IP:-8.8.8.8 1.1.1.1}${EXTRA_DNS:+,${EXTRA_DNS[*]}}
-  SSH: Port 2222, key-based auth only. Users with SSH keys: ${SSH_USERS[*]:-none}.
-  To add more keys, paste them into ~/.ssh/authorized_keys for each user.
-  Log: $LOGFILE (your new bedtime reading)
-EOF
+'
 
 exit 0  # We did it, folks! Time for a victory nap.
