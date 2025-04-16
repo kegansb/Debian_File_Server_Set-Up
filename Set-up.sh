@@ -196,8 +196,23 @@ Address=$SERVER_IP/24
 Gateway=$GATEWAY
 DNS=$DNS_SERVERS
 EOF
-run_command systemctl enable systemd-networkd
-run_command systemctl restart systemd-networkd
+# Another headache found, another fix put into place... Cross those fingers!
+# Check if systemd-networkd is available and not already running
+if systemctl list-unit-files | grep -q systemd-networkd.service; then
+    echo "systemd-networkd is available"
+
+    # Check if it's running, only then restart it
+    if ! systemctl is-active --quiet systemd-networkd; then
+        echo "Enabling and starting systemd-networkd"
+        run_command systemctl enable systemd-networkd
+        run_command systemctl start systemd-networkd
+    else
+        echo "systemd-networkd already running, restarting"
+        run_command systemctl restart systemd-networkd
+    fi
+else
+    echo "systemd-networkd is not installed or not found, skipping"
+fi
 
 # Secure SSH
 echo "Securing SSH... because who needs hackers in their life?" | tee -a "$LOGFILE"
