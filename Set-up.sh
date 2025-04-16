@@ -3,7 +3,7 @@
 # Script to set up a Debian file server with Samba for Windows, macOS, and Linux
 # Supports Active Directory join, avoids Bind9, uses system/AD passwords
 # Run as root on a clean Debian 12 (Bookworm) minimal install
-# Now with 100% more jokes to keep you sane during setup!
+# Now with SSH key setup automation and 100% more jokes to keep you sane!
 
 # Exit on any error
 set -e
@@ -40,6 +40,12 @@ validate_ip() {
 validate_share_name() {
     local name=$1
     [[ $name =~ ^[a-zA-Z0-9]+$ ]] || { echo "Share name is sus. Alphanumeric only, no spaces, you rebel!" | tee -a "$LOGFILE"; return 1; }
+}
+
+# Function to validate SSH public key (basic check)
+validate_ssh_key() {
+    local key=$1
+    [[ $key =~ ^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp256) ]] || { echo "That’s not an SSH public key, it’s a cry for help! Starts with ssh-ed25519 or ssh-rsa, try again." | tee -a "$LOGFILE"; return 1; }
 }
 
 # Check if running as root
@@ -236,6 +242,7 @@ run_command chmod 1777 "$RECYCLE_DIR"  # Sticky bit, because deleted files need 
 
 # Process users (non-AD only)
 USER_SHARES=""
+SSH_USERS=()
 if [ "$AD_JOIN" != "y" ]; then
     for USER in "${USERS[@]}"; do
         USER=$(echo "$USER" | tr -d '[:space:]')
@@ -286,6 +293,28 @@ if [ "$AD_JOIN" != "y" ]; then
    create mask = 0600
    directory mask = 0700
 "
+        
+        # Setup SSH key
+        echo "Add an SSH public key for $USER? (y/N):"
+        read -r SSH_ANSWER
+        if [ "${SSH_ANSWER,,}" = "y" ]; then
+            echo "Paste the SSH public key for $USER (e.g., ssh-ed25519 AAAAC3...):"
+            read -r SSH_KEY
+            if validate_ssh_key "$SSH_KEY"; then
+                SSH_DIR="/home/$USER/.ssh"
+                AUTH_KEYS="$SSH_DIR/authorized_keys"
+                run_command mkdir -p "$SSH_DIR"
+                run_command chown "$USER":"$USER" "$SSH_DIR"
+                run_command chmod 700 "$SSH_DIR"
+                echo "$SSH_KEY" | run_command tee -a "$AUTH_KEYS"
+                run_command chown "$USER":"$USER" "$AUTH_KEYS"
+                run_command chmod 600 "$AUTH_KEYS"
+                SSH_USERS+=("$USER")
+                echo "SSH key added for $USER. Ready to SSH like a pro!" | tee -a "$LOGFILE"
+            else
+                echo "Snark alert: That key looks like you mashed the keyboard! SSH setup skipped for $USER." | tee -a "$LOGFILE"
+            fi
+        fi
     done
 fi
 
@@ -324,6 +353,41 @@ EOF
     run_command chmod 600 /etc/sssd/sssd.conf
     run_command systemctl restart sssd
     run_command systemctl enable sssd
+
+    # Setup SSH keys for AD users
+    echo "Configure SSH keys for AD users? (y/N):"
+    read -r AD_SSH_ANSWER
+    if [ "${AD_SSH_ANSWER,,}" = "y" ]; then
+        echo "Enter AD usernames to configure SSH for (comma-separated, e.g., alice,bob):"
+        read -r AD_USER_INPUT
+        IFS=',' read -r -a AD_USERS <<< "$AD_USER_INPUT"
+        for AD_USER in "${AD_USERS[@]}"; do
+            AD_USER=$(echo "$AD_USER" | tr -d '[:space:]')
+            [ -z "$AD_USER" ] && continue
+            echo "Processing SSH setup for AD user: $AD_USER" | tee -a "$LOGFILE"
+            SSH_DIR="/home/$AD_USER/.ssh"
+            AUTH_KEYS="$SSH_DIR/authorized_keys"
+            # Create home directory if it doesn't exist
+            if ! id "$AD_USER" > /dev/null 2>&1; then
+                echo "Warning: AD user $AD_USER not found. Ensure they log in first or check SSSD config." | tee -a "$LOGFILE"
+                continue
+            fi
+            run_command mkdir -p "$SSH_DIR"
+            run_command chown "$AD_USER":"$AD_USER" "$SSH_DIR"
+            run_command chmod 700 "$SSH_DIR"
+            echo "Paste the SSH public key for $AD_USER (e.g., ssh-ed25519 AAAAC3...):"
+            read -r SSH_KEY
+            if validate_ssh_key "$SSH_KEY"; then
+                echo "$SSH_KEY" | run_command tee -a "$AUTH_KEYS"
+                run_command chown "$AD_USER":"$AD_USER" "$AUTH_KEYS"
+                run_command chmod 600 "$AUTH_KEYS"
+                SSH_USERS+=("$AD_USER")
+                echo "SSH key added for AD user $AD_USER. Secure access granted!" | tee -a "$LOGFILE"
+            else
+                echo "Snark alert: That key looks like you mashed the keyboard! SSH setup skipped for $AD_USER." | tee -a "$LOGFILE"
+            fi
+        done
+    fi
 fi
 
 # Configure Samba with recycle bin
@@ -431,7 +495,7 @@ else
   Main Share:
     - Windows: \\\\$SERVER_IP\\$SHARE_NAME, use username (e.g., ${USERS[0]})
     - macOS: Cmd+K, smb://$SERVER_IP/$SHARE_NAME
-    - Linux: mount -t cifs //$SERVER_IP/$SHARE_NAME /mnt -o username=${USERS[0]}
+    - Linux: mount -t cifs //$SERVER_IP/$SHARE_NAME /mnt -o username=${USERS[0]})
   User Shares:
 EOF
     for USER in "${USERS[@]}"; do
@@ -447,7 +511,8 @@ fi
 cat << EOF | tee -a "$LOGFILE"
   Server IP: $SERVER_IP
   DNS Servers: ${DC_IP:-8.8.8.8 1.1.1.1}${EXTRA_DNS:+,${EXTRA_DNS[*]}}
-  SSH: Port 2222, key-based auth only. Copy key to user ~/.ssh/authorized_keys or face eternal sadness.
+  SSH: Port 2222, key-based auth only. Users with SSH keys: ${SSH_USERS[*]:-none}.
+  To add more keys, paste them into ~/.ssh/authorized_keys for each user.
   Log: $LOGFILE (your new bedtime reading)
 EOF
 
